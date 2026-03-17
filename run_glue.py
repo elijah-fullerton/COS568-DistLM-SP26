@@ -110,6 +110,7 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    num_reported_minibatches = 0
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -125,23 +126,22 @@ def train(args, train_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
+            # Print loss for the first five minibatches (on main process only)
+            if num_reported_minibatches < 5 and args.local_rank in [-1, 0]:
+                print(f"Minibatch {num_reported_minibatches + 1} loss: {loss.item()}")
+                num_reported_minibatches += 1
+
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
             else:
-                ##################################################
-                # TODO(cos568): perform backward pass here (expect one line of code)
-                
-                ##################################################
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                ##################################################
-                # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
-                
-                ##################################################
+                optimizer.step()
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
@@ -153,10 +153,7 @@ def train(args, train_dataset, model, tokenizer):
             train_iterator.close()
             break
         
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-
-        ##################################################
+        evaluate(args, model, tokenizer, prefix=f"epoch_{_}")
 
     return global_step, tr_loss / global_step
 
@@ -384,12 +381,7 @@ def main():
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    
-    ##################################################
-    # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
-    # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-
-    ##################################################
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
