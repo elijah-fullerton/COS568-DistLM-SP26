@@ -22,6 +22,11 @@ import glob
 import logging
 import os
 import random
+import time
+
+import matplotlib
+matplotlib.use("Agg")  # Headless-friendly plotting (for servers/cluster nodes)
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
@@ -66,12 +71,101 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
     torch.cuda.manual_seed_all(args.seed)
 
+def init_distributed_mode(args):
+    """
+    Initialize torch.distributed with TCP init_method.
+    The assignment uses `--local_rank` as the rank (0..world_size-1).
+    """
+    if args.local_rank == -1:
+        args.world_size = 1
+        args.rank = 0
+        return
+
+    if args.world_size is None or args.world_size < 1:
+        raise ValueError("In distributed mode you must pass a valid --world_size.")
+    if not args.master_ip:
+        raise ValueError("In distributed mode you must pass a valid --master_ip.")
+    if args.master_port is None:
+        raise ValueError("In distributed mode you must pass a valid --master_port.")
+
+    backend = "nccl" if args.device.type == "cuda" else "gloo"
+    if backend == "nccl":
+        # Required by NCCL when using multiple GPU processes per node.
+        torch.cuda.set_device(args.local_rank)
+        args.device = torch.device("cuda", args.local_rank)
+
+    torch.distributed.init_process_group(
+        backend=backend,
+        init_method=f"tcp://{args.master_ip}:{args.master_port}",
+        world_size=args.world_size,
+        rank=args.local_rank,
+    )
+    args.rank = args.local_rank
+
+def sync_gradients_gather_scatter(args, model):
+    """
+    Average gradients across ranks using gather/scatter in gloo or nccl.
+    Rank 0 gathers all grads, computes the element-wise mean, and scatters it back.
+    """
+    if args.local_rank == -1 or args.world_size == 1:
+        return
+
+    params_with_grad = []
+    grad_shapes = []
+    grad_numels = []
+    flat_grads = []
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        params_with_grad.append(p)
+        grad_shapes.append(tuple(p.grad.data.shape))
+        grad_numels.append(p.grad.data.numel())
+        flat_grads.append(p.grad.data.contiguous().view(-1))
+
+    if not flat_grads:
+        return
+
+    flat_grad = torch.cat(flat_grads)
+
+    gather_list = None
+    if args.local_rank == 0:
+        gather_list = [torch.zeros_like(flat_grad) for _ in range(args.world_size)]
+    torch.distributed.gather(flat_grad, gather_list=gather_list, dst=0)
+
+    scatter_list = None
+    if args.local_rank == 0:
+        mean_flat = torch.zeros_like(flat_grad)
+        for g in gather_list:
+            mean_flat.add_(g)
+        mean_flat.div_(args.world_size)
+        scatter_list = [mean_flat.clone() for _ in range(args.world_size)]
+
+    out_flat = torch.zeros_like(flat_grad)
+    torch.distributed.scatter(out_flat, scatter_list=scatter_list, src=0)
+
+    offset = 0
+    for p, shape, numel in zip(params_with_grad, grad_shapes, grad_numels):
+        new_grad = out_flat[offset:offset + numel].view(shape)
+        p.grad.data.copy_(new_grad)
+        offset += numel
+
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    is_distributed = args.local_rank != -1
+    if is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.local_rank,
+            shuffle=True,
+            seed=args.seed,
+        )
+    else:
+        train_sampler = RandomSampler(train_dataset)
+
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -110,11 +204,18 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    opt_step_times = []
+    step_history = []
+    loss_history = []
     num_reported_minibatches = 0
-    for _ in train_iterator:
+    for epoch_idx in train_iterator:
+        if is_distributed:
+            train_sampler.set_epoch(epoch_idx)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             model.train()
+            if step % args.gradient_accumulation_steps == 0:
+                iter_start = time.perf_counter()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
                       'attention_mask': batch[1],
@@ -126,25 +227,37 @@ def train(args, train_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            # Print loss for the first five minibatches (on main process only)
-            if num_reported_minibatches < 5 and args.local_rank in [-1, 0]:
+            # Task 1 requirement: print loss for first five minibatches (single-node only).
+            if (not is_distributed) and num_reported_minibatches < 5 and args.local_rank in [-1, 0]:
                 print(f"Minibatch {num_reported_minibatches + 1} loss: {loss.item()}")
                 num_reported_minibatches += 1
 
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
+                if is_distributed:
+                    sync_gradients_gather_scatter(args, model)
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
             else:
                 loss.backward()
+                if is_distributed:
+                    sync_gradients_gather_scatter(args, model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
+                iter_end = time.perf_counter()
                 optimizer.step()
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+                step_history.append(global_step)
+                loss_history.append(loss.item())
+
+                if is_distributed:
+                    opt_step_times.append(iter_end - iter_start)
+                    # Loss curve per node for Task 2(a) logging.
+                    print(f"rank {args.local_rank} global_step {global_step} loss {loss.item()}")
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -153,12 +266,44 @@ def train(args, train_dataset, model, tokenizer):
             train_iterator.close()
             break
         
-        evaluate(args, model, tokenizer, prefix=f"epoch_{_}")
+        evaluate(args, model, tokenizer, prefix=f"epoch_{epoch_idx}")
+        if is_distributed:
+            torch.distributed.barrier()
+
+    if is_distributed and args.local_rank == 0 and len(opt_step_times) > 1:
+        avg_time = sum(opt_step_times[1:]) / len(opt_step_times[1:])
+        print(f"Task2(a) avg opt-step time excl first: {avg_time:.6f}s")
+
+    # Save training loss curve (one curve per rank/node).
+    if len(step_history) > 0:
+        rank_tag = f"rank{args.local_rank}" if args.local_rank != -1 else "single"
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        data_path = os.path.join(args.output_dir, f"loss_curve_{rank_tag}.txt")
+        with open(data_path, "w") as f:
+            for s, l in zip(step_history, loss_history):
+                f.write(f"{s}\t{l}\n")
+
+        plt.figure()
+        plt.plot(step_history, loss_history)
+        plt.xlabel("Optimization step")
+        plt.ylabel("Loss")
+        plt.title(f"Training loss ({rank_tag})")
+        plot_path = os.path.join(args.output_dir, f"loss_curve_{rank_tag}.png")
+        plt.savefig(plot_path, bbox_inches="tight")
+        plt.close()
 
     return global_step, tr_loss / global_step
 
 
 def evaluate(args, model, tokenizer, prefix=""):
+    # For distributed training, only rank 0 runs evaluation + writes metrics.
+    if args.local_rank != -1:
+        torch.distributed.barrier()
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+        return {}
+
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
@@ -212,13 +357,18 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        safe_prefix = prefix if prefix else "final"
+        safe_prefix = safe_prefix.replace("/", "_").replace("\\", "_")
+        output_eval_file = os.path.join(eval_output_dir, f"eval_results_{safe_prefix}.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
+            writer.write(f"eval_loss = {eval_loss}\n")
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
 
+    if args.local_rank != -1:
+        torch.distributed.barrier()
     return results
 
 
@@ -345,6 +495,12 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument("--master_ip", type=str, default="",
+                        help="For distributed training: IP address of the master node.")
+    parser.add_argument("--master_port", type=int, default=None,
+                        help="For distributed training: TCP port for init_process_group.")
+    parser.add_argument("--world_size", type=int, default=None,
+                        help="For distributed training: total number of processes/nodes.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -363,6 +519,9 @@ def main():
 
     # Set seed
     set_seed(args)
+
+    # Initialize distributed environment (if requested).
+    init_distributed_mode(args)
 
     # Prepare GLUE task
     args.task_name = args.task_name.lower()
