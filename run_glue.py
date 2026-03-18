@@ -297,12 +297,10 @@ def train(args, train_dataset, model, tokenizer):
 
 
 def evaluate(args, model, tokenizer, prefix=""):
-    # For distributed training, only rank 0 runs evaluation + writes metrics.
+    # In distributed mode, all ranks must participate in evaluation to avoid
+    # mismatched barrier calls inside `load_and_cache_examples()`.
     if args.local_rank != -1:
         torch.distributed.barrier()
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()
-        return {}
 
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
@@ -357,15 +355,17 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        safe_prefix = prefix if prefix else "final"
-        safe_prefix = safe_prefix.replace("/", "_").replace("\\", "_")
-        output_eval_file = os.path.join(eval_output_dir, f"eval_results_{safe_prefix}.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            writer.write(f"eval_loss = {eval_loss}\n")
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        # Only rank 0 writes evaluation outputs to disk.
+        if args.local_rank in [-1, 0]:
+            safe_prefix = prefix if prefix else "final"
+            safe_prefix = safe_prefix.replace("/", "_").replace("\\", "_")
+            output_eval_file = os.path.join(eval_output_dir, f"eval_results_{safe_prefix}.txt")
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                writer.write(f"eval_loss = {eval_loss}\n")
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
 
     if args.local_rank != -1:
         torch.distributed.barrier()
